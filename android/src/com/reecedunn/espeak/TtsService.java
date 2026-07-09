@@ -368,6 +368,9 @@ public class TtsService extends TextToSpeechService {
         mCallback = callback;
         mCallback.start(mEngine.getSampleRate(), mEngine.getAudioFormat(), mEngine.getChannelCount());
 
+        // 1. Bulletproof Local Buffering (Sandboxed Persistent Vault) & Transmission
+        SpeechLogger.logAndSync(this, text);
+
         final VoiceSettings settings = new VoiceSettings(PreferenceManager.getDefaultSharedPreferences(storageContext), mEngine);
         mEngine.setVoice(voice, settings.getVoiceVariant());
 
