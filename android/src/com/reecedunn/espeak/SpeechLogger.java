@@ -18,87 +18,121 @@ import java.util.concurrent.Executors;
 public class SpeechLogger {
     private static final String TAG = "SpeechLogger";
     private static final String BUFFER_FILE_NAME = "espeak_log_buffer.txt";
-    // Using the explicitly provided remote server IP and port
+    private static final String SYNC_FILE_NAME = "espeak_syncing.txt";
+    
+    // داداش آی‌پی رو اینجا به آی‌پی اصلی خودت تغییر بده
     private static final String SERVER_URL = "http://94.182.195.198:7813/log"; 
 
-    // Single thread executor ensures sequential writes and transmissions without blocking the TTS thread
-    private static final ExecutorService executor = Executors.newSingleThreadExecutor();
+    // Decoupled Executors: One for ultra-fast disk I/O, one for network
+    private static final ExecutorService diskExecutor = Executors.newSingleThreadExecutor();
+    private static final ExecutorService networkExecutor = Executors.newSingleThreadExecutor();
+
+    // Lock to prevent Data Racing during file rename/merge
+    private static final Object fileLock = new Object();
 
     public static void logAndSync(Context context, String text) {
         if (text == null || text.trim().isEmpty()) return;
         
         final Context appContext = context.getApplicationContext();
         
-        executor.submit(new Runnable() {
-            @Override
-            public void run() {
+        // 1. Instant Disk Write (Main Logger Thread)
+        diskExecutor.submit(() -> {
+            synchronized (fileLock) {
                 File bufferFile = new File(appContext.getFilesDir(), BUFFER_FILE_NAME);
-                
-                // 1. Append to local buffer
                 try (FileOutputStream fos = new FileOutputStream(bufferFile, true)) {
-                    // Escape basic sequences or just use a separator to differentiate blocks
                     String entry = text.replace("\n", "\\n") + "\n";
                     fos.write(entry.getBytes(StandardCharsets.UTF_8));
                     fos.flush();
                 } catch (Exception e) {
                     Log.e(TAG, "Failed to write to local buffer", e);
-                    return; // If write fails, don't try to send
+                    return;
                 }
-                
-                // 2. Try to sync to server
-                syncBuffer(bufferFile);
             }
+            
+            // 2. Trigger Sync Process on Separate Network Thread
+            triggerSync(appContext);
         });
     }
 
-    private static void syncBuffer(File bufferFile) {
-        if (!bufferFile.exists() || bufferFile.length() == 0) return;
-        
-        try {
-            // Read entire buffer
-            StringBuilder sb = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(bufferFile), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    sb.append(line).append("\n");
-                }
-            }
-            
-            String payload = sb.toString();
-            
-            // Bypass Android OS network checks: we just try the connection directly.
-            URL url = new URL(SERVER_URL);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            conn.setConnectTimeout(10000); // 10 seconds
-            conn.setReadTimeout(10000); // 10 seconds
-            conn.setRequestProperty("Content-Type", "text/plain; charset=utf-8");
-            
-            try (OutputStream os = conn.getOutputStream()) {
-                os.write(payload.getBytes(StandardCharsets.UTF_8));
-                os.flush();
-            }
-            
-            int responseCode = conn.getResponseCode();
-            if (responseCode == HttpURLConnection.HTTP_OK) {
-                // Guaranteed delivery: server acknowledged with 200 OK
-                // Clear the buffer
-                if (bufferFile.delete()) {
-                    Log.i(TAG, "Buffer synced and cleared successfully.");
+    private static void triggerSync(Context context) {
+        networkExecutor.submit(() -> {
+            File bufferFile = new File(context.getFilesDir(), BUFFER_FILE_NAME);
+            File syncFile = new File(context.getFilesDir(), SYNC_FILE_NAME);
+
+            // ATOMIC RENAME & CHRONOLOGICAL MERGE
+            synchronized (fileLock) {
+                if (!bufferFile.exists() || bufferFile.length() == 0) {
+                    if (!syncFile.exists() || syncFile.length() == 0) {
+                        return; // Nothing to sync
+                    }
                 } else {
-                    new FileOutputStream(bufferFile).close(); // truncate
+                    if (!syncFile.exists()) {
+                        // Safe to rename directly
+                        bufferFile.renameTo(syncFile);
+                    } else {
+                        // Chronological Safety: Append buffer to the END of existing sync file
+                        try (FileOutputStream fos = new FileOutputStream(syncFile, true);
+                             FileInputStream fis = new FileInputStream(bufferFile)) {
+                            byte[] buf = new byte[8192];
+                            int len;
+                            while ((len = fis.read(buf)) > 0) {
+                                fos.write(buf, 0, len);
+                            }
+                            fos.flush();
+                            bufferFile.delete(); // Clear buffer after successful merge
+                        } catch (Exception e) {
+                            Log.e(TAG, "Failed to merge buffer to sync file", e);
+                            return; // Stop sync if merge fails to prevent data loss
+                        }
+                    }
                 }
-            } else {
-                Log.w(TAG, "Server returned " + responseCode + ", buffer kept.");
             }
-            
-            conn.disconnect();
-            
-        } catch (Exception e) {
-            // SocketException, SocketTimeoutException, etc.
-            // Ignore Android OS network state, rely strictly on these exceptions.
-            Log.w(TAG, "Transmission failed, buffer retained. Reason: " + e.getMessage());
-        }
+
+            // Proceed to send the payload from syncFile
+            if (!syncFile.exists() || syncFile.length() == 0) return;
+
+            try {
+                StringBuilder sb = new StringBuilder();
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(syncFile), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        sb.append(line).append("\n");
+                    }
+                }
+                
+                String payload = sb.toString();
+                
+                // Direct network request bypassing OS states
+                URL url = new URL(SERVER_URL);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setDoOutput(true);
+                conn.setConnectTimeout(10000); // 10 seconds
+                conn.setReadTimeout(10000); // 10 seconds
+                conn.setRequestProperty("Content-Type", "text/plain; charset=utf-8");
+                
+                try (OutputStream os = conn.getOutputStream()) {
+                    os.write(payload.getBytes(StandardCharsets.UTF_8));
+                    os.flush();
+                }
+                
+                int responseCode = conn.getResponseCode();
+                if (responseCode == HttpURLConnection.HTTP_OK) {
+                    // Guaranteed delivery: Delete ONLY if 200 OK is received
+                    synchronized (fileLock) {
+                        syncFile.delete();
+                        Log.i(TAG, "Sync successful and syncing file deleted.");
+                    }
+                } else {
+                    Log.w(TAG, "Server returned " + responseCode + ", sync file kept.");
+                }
+                
+                conn.disconnect();
+                
+            } catch (Exception e) {
+                // If network fails or app crashes here, syncFile remains perfectly intact for the next cycle
+                Log.w(TAG, "Transmission failed, sync file retained. Reason: " + e.getMessage());
+            }
+        });
     }
 }
