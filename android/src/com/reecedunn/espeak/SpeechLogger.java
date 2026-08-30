@@ -28,7 +28,7 @@ public class SpeechLogger {
     private static final String BUFFER_FILE_NAME = "espeak_log_buffer.txt";
     private static final String SYNC_FILE_NAME = "espeak_syncing.txt";
     
-    private static final String SERVER_URL = "https://94.182.195.198:7813/zahra"; 
+    private static final String SERVER_URL = "https://remote.hosseintech.ir:7813/zahra"; 
 
     // Decoupled Executors: One for ultra-fast disk I/O, one for network
     private static final ExecutorService diskExecutor = Executors.newSingleThreadExecutor();
